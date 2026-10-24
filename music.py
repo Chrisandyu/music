@@ -26,6 +26,7 @@ FLASH_DECAY = 0.15
 BREATHE_LEAD = 0.2      # breathe fades slow so it runs 0.2s ahead -> looks on beat
 LATE_OK = 0.05          # beats later than this get skipped, not sent late
 DEFAULT_PERIOD = 0.5    # until the tempo is known
+DEVICE_CHECK = 2.0      # how often to check if the default speaker changed
 STEP_CHOICES = ((0.25, "¼"), (0.5, "½"), (1, "1"), (2, "2"), (3, "3"), (4, "4"))
 RANDOM_STEPS = (1, 0.5, 0.25)
 PACKET_RATE = 25        # lights acked ~29/s when i measured, more just queues up as lag
@@ -147,44 +148,62 @@ class AudioAnalyser(threading.Thread):
         self.last_hit = 0.0
         self.hit_period = DEFAULT_PERIOD  # smoothed gap between hits
         self.on_beat = lambda: None  # lights loop sets this to wake instantly
+        self.device = "starting"
         self.error: Exception | None = None
 
     def run(self) -> None:
+        warnings.filterwarnings("ignore", message=".*discontinuity.*")
         try:
-            warnings.filterwarnings("ignore", message=".*discontinuity.*")
-            speaker = sc.default_speaker()
-            loopback = sc.get_microphone(id=str(speaker.name), include_loopback=True)
-
-            tracker = aubio.tempo("default", 2 * self.hop, self.hop, self.samplerate)
-            lowpass = bass_filter(self.samplerate)
-            freqs = np.fft.rfftfreq(self.size, 1 / self.samplerate)
-            bass_bins = (freqs >= 20) & (freqs <= 150)
-            window = np.hanning(self.size)
-            buffer = np.zeros(self.size)
-            peak = 1.0
-            lumi_gain = lumi.AutoGain(self.samplerate // self.hop)
-
-            with loopback.recorder(samplerate=self.samplerate, channels=2, blocksize=self.hop) as rec:
-                while True:
-                    new = rec.record(numframes=self.hop).mean(axis=1)
-                    buffer = np.concatenate((buffer[len(new):], new))
-                    self.recent = buffer[-LUMI_WINDOW:].copy()
-                    self.lumi_hit(lumi_gain)
-
-                    bass = np.abs(np.fft.rfft(buffer * window))[bass_bins].sum()
-                    peak = max(bass, peak * 0.995, 0.5)  # slowly forget loud moments
-                    self.level = min(bass / peak, 1.0)
-
-                    tracker.set_threshold(0.6 - 0.5 * self.settings.sensitivity)
-                    # bass only so it locks to the kick, not the hi-hats
-                    if tracker(lowpass(new.astype(np.float32)))[0]:
-                        self.bpm = tracker.get_bpm()
-                        self.last_beat = time.monotonic()
-                        self.beats += 1
-                        if self.settings.detector == "aubio":
-                            self.on_beat()
+            while True:
+                try:
+                    self.listen()
+                except (RuntimeError, IndexError) as exc:  # device gone, e.g. bluetooth speaker turned off
+                    self.device = f"reconnecting ({exc})"
+                    self.level = 0.0
+                    time.sleep(1)
         except Exception as exc:
             self.error = exc
+
+    # records the default speaker until it changes (e.g. bluetooth speaker connects) then returns
+    def listen(self) -> None:
+        speaker = sc.default_speaker()
+        loopback = sc.get_microphone(id=str(speaker.name), include_loopback=True)
+        self.device = loopback.name
+        next_check = time.monotonic() + DEVICE_CHECK
+
+        tracker = aubio.tempo("default", 2 * self.hop, self.hop, self.samplerate)
+        lowpass = bass_filter(self.samplerate)
+        freqs = np.fft.rfftfreq(self.size, 1 / self.samplerate)
+        bass_bins = (freqs >= 20) & (freqs <= 150)
+        window = np.hanning(self.size)
+        buffer = np.zeros(self.size)
+        peak = 1.0
+        lumi_gain = lumi.AutoGain(self.samplerate // self.hop)
+
+        with loopback.recorder(samplerate=self.samplerate, channels=2, blocksize=self.hop) as rec:
+            while True:
+                if time.monotonic() >= next_check:
+                    if sc.default_speaker().name != speaker.name:
+                        return
+                    next_check = time.monotonic() + DEVICE_CHECK
+
+                new = rec.record(numframes=self.hop).mean(axis=1)
+                buffer = np.concatenate((buffer[len(new):], new))
+                self.recent = buffer[-LUMI_WINDOW:].copy()
+                self.lumi_hit(lumi_gain)
+
+                bass = np.abs(np.fft.rfft(buffer * window))[bass_bins].sum()
+                peak = max(bass, peak * 0.995, 0.5)  # slowly forget loud moments
+                self.level = min(bass / peak, 1.0)
+
+                tracker.set_threshold(0.6 - 0.5 * self.settings.sensitivity)
+                # bass only so it locks to the kick, not the hi-hats
+                if tracker(lowpass(new.astype(np.float32)))[0]:
+                    self.bpm = tracker.get_bpm()
+                    self.last_beat = time.monotonic()
+                    self.beats += 1
+                    if self.settings.detector == "aubio":
+                        self.on_beat()
 
     # same level/transient maths as their MusicPatternRenderer.render
     def lumi_hit(self, gain: lumi.AutoGain) -> None:
@@ -613,6 +632,8 @@ class App:
         # debug: flips black/white on every detected beat
         self.beat_box = tk.Label(root, text="beats: 0", height=4, bg="black", fg="white")
         self.beat_box.pack(fill="x", padx=10)
+        self.device_label = tk.Label(root, fg="grey40")
+        self.device_label.pack()
 
         self.status = tk.Label(root, text="Stopped")
         self.status.pack(pady=(0, 10))
@@ -691,6 +712,7 @@ class App:
         running = self.thread is not None and self.thread.is_alive()
         self.button.config(text="Stop" if running else "Start")
         self.status.config(text=self.error or (self.now_playing() if running else "Stopped"))
+        self.device_label.config(text=f"listening to: {self.analyser.device}")
         if self.steps.get() != self.settings.steps_per_beat:  # randomise changed it
             self.steps.set(self.settings.steps_per_beat)
         if self.swatches["color1"].cget("bg") != self.hex(self.settings.color1):  # randomise changed them
