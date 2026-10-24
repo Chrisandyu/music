@@ -9,6 +9,7 @@ import threading
 import time
 import tkinter as tk
 import warnings
+from collections import deque
 from dataclasses import dataclass
 from tkinter import colorchooser
 
@@ -27,6 +28,13 @@ BREATHE_LEAD = 0.2      # breathe fades slow so it runs 0.2s ahead -> looks on b
 LATE_OK = 0.05          # beats later than this get skipped, not sent late
 DEFAULT_PERIOD = 0.5    # until the tempo is known
 DEVICE_CHECK = 2.0      # how often to check if the default speaker changed
+BAR_MEMORY = 0.95       # per beat, how slowly the beat 1 guess forgets old bars
+BAR_SWITCH = 0.15       # new beat 1 guess has to win by this much, stops it flickering
+ACCENT_GAP = 0.15       # s between accents at least
+TRACK_WINDOW = 8.0      # s of onsets the beat tracker looks back at
+TEMPO_PRIOR = 120       # bpm the tracker leans towards when unsure
+TEMPO_KEEP = 0.05       # octaves, how hard it holds its current tempo -> cross rhythms can't take over
+TEMPO_ESCAPE = 4.0      # s a clearly better tempo has to keep winning to take over -> fixes a bad first guess
 STEP_CHOICES = ((0.25, "¼"), (0.5, "½"), (1, "1"), (2, "2"), (3, "3"), (4, "4"))
 RANDOM_STEPS = (1, 0.5, 0.25)
 PACKET_RATE = 25        # lights acked ~29/s when i measured, more just queues up as lag
@@ -102,13 +110,14 @@ class Settings:
         self.brightness = 0.8
         self.intensity = 0.7    # 0 = steady, 1 = follows the music fully
         self.sensitivity = 0.5
-        self.detector = "aubio"  # or "lumisync"
+        self.detector = "aubio"  # or "accents" / "lumisync"
         self.delay = 0.05       # send beats early to cover bluetooth lag
         self.scheme = "Police"    # or "Custom"
         self.color1, self.color2 = SCHEMES[self.scheme]
         self.random_colours = False
         self.steps_per_beat = 1
         self.offbeat = False      # ½ and ¼ step on the upbeat instead
+        self.auto_bar = True      # line ½ and ¼ up with beat 1 of the bar
         self.random_steps = False
         self.patterns = ["pulse"]
         self.switch_seconds = 20.0
@@ -116,19 +125,147 @@ class Settings:
         self.switch_at = 0.0
 
 
-# low pass biquad (rbj cookbook)
-def bass_filter(samplerate: int, cutoff: float = 150.0) -> aubio.digital_filter:
+# rbj cookbook biquad, kind = "low" or "high" pass
+def biquad(samplerate: int, cutoff: float, kind: str) -> aubio.digital_filter:
     w0 = 2 * np.pi * cutoff / samplerate
     alpha = np.sin(w0) / (2 * 0.707)
     cos = np.cos(w0)
     a0 = 1 + alpha
+    b0, b1 = ((1 - cos) / 2, 1 - cos) if kind == "low" else ((1 + cos) / 2, -(1 + cos))
     f = aubio.digital_filter(3)
-    f.set_biquad((1 - cos) / 2 / a0, (1 - cos) / a0, (1 - cos) / 2 / a0, -2 * cos / a0, (1 - alpha) / a0)
+    f.set_biquad(b0 / a0, b1 / a0, b0 / a0, -2 * cos / a0, (1 - alpha) / a0)
     return f
 
 
+# live beat tracker with tempo memory (ellis 2007 / librosa style, made online)
+# aubio alone jumped to cross rhythms mid song, 116 -> 155 bpm on raye, 162 -> 108 on see you again
+class BeatTracker:
+    def __init__(self, samplerate: int, hop: int, size: int):
+        self.fps = samplerate / hop
+        freqs = np.fft.rfftfreq(size, 1 / samplerate)
+        self.bins = (freqs >= 30) & (freqs <= 8000)
+        f = freqs[self.bins]
+        self.weights = np.where(f < 250, 1.0, np.where(f < 4000, 0.5, 0.15))  # drums count more than hi-hats
+        self.prev: np.ndarray | None = None
+        self.onsets = deque(maxlen=int(TRACK_WINDOW * self.fps))
+        self.frame = 0
+        self.bpm = 0.0
+        self.period: float | None = None  # frames per beat
+        self.next_beat: float | None = None
+        self.every = int(self.fps / 2)
+        self.challenged = 0  # updates in a row a different tempo has been clearly better
+        self.lags = np.arange(int(self.fps * 60 / 200), int(self.fps * 60 / 60) + 1)
+
+    # true when a beat lands on this frame
+    def process(self, spectrum: np.ndarray) -> bool:
+        mag = np.log1p(1000 * spectrum[self.bins])
+        self.onsets.append(0.0 if self.prev is None else float(np.dot(np.maximum(mag - self.prev, 0), self.weights)))
+        self.prev = mag
+        self.frame += 1
+        if self.frame % self.every == 0 and len(self.onsets) >= 4 * self.fps:
+            self.update()
+        if self.next_beat is not None and self.frame >= self.next_beat:
+            self.next_beat += self.period
+            return True
+        return False
+
+    def update(self) -> None:
+        e = np.convolve(np.array(self.onsets), np.hanning(5) / np.hanning(5).sum(), mode="same")
+        e -= e.mean()
+        n = len(e)
+        auto = lambda lag: max(np.dot(e[lag:], e[:-lag]) / (n - lag), 0) if lag < n - 10 else 0.0
+        bpms = 60 * self.fps / self.lags
+        # a real beat repeats at 2x its period too, a cross rhythm usually doesn't -> 80 not 120, 128 not 64
+        free = np.array([auto(lag) + auto(2 * lag) for lag in self.lags]) * np.exp(-0.5 * np.log2(bpms / TEMPO_PRIOR) ** 2)
+        score = free
+        if self.bpm:
+            score = free * (0.15 + np.exp(-0.5 * (np.log2(bpms / self.bpm) / TEMPO_KEEP) ** 2))
+            best, ours = int(np.argmax(free)), int(np.argmin(np.abs(bpms - self.bpm)))
+            clearly_better = abs(bpms[best] / self.bpm - 1) > 0.04 and free[best] > 1.3 * free[ours]
+            self.challenged = self.challenged + 1 if clearly_better else 0
+            if self.challenged * self.every >= TEMPO_ESCAPE * self.fps:
+                score, self.challenged = free, 0
+        i = int(np.argmax(score))
+        if score[i] <= 0:
+            return
+        period = float(self.lags[i])
+        if 0 < i < len(score) - 1:  # parabola through the peak -> fractional lag
+            y0, y1, y2 = score[i - 1], score[i], score[i + 1]
+            if y0 - 2 * y1 + y2 != 0:
+                period += max(-0.5, min(0.5, 0.5 * (y0 - y2) / (y0 - 2 * y1 + y2)))
+        if self.period is None or abs(period / self.period - 1) > 0.04:  # keep ours while it agrees
+            self.period = period
+        period = self.period
+        self.bpm = 60 * self.fps / period
+
+        # phase: where a pulse train with this period best lines up with recent onsets
+        best, best_phase = -np.inf, 0
+        for phase in range(int(round(period))):
+            idx = (n - 1 - phase - np.arange(0, n - phase, period)).astype(int)
+            idx = idx[idx >= 0]
+            fit = float(np.dot(e[idx], np.exp(-np.arange(len(idx)) / 6.0)))  # recent beats count more
+            if fit > best:
+                best, best_phase = fit, phase
+        target = self.frame - best_phase + period
+        while target <= self.frame:
+            target += period
+        if self.next_beat is None:
+            self.next_beat = target
+        else:  # pull halfway towards it, no jumping
+            self.next_beat += 0.5 * ((target - self.next_beat + period / 2) % period - period / 2)
+
+
+# finds beat 1 of the bar without looking the song up (goto & muraoka style):
+# kick on 1 and 3, snare on 2 and 4, chords change on 1
+class DownbeatFinder:
+    def __init__(self, samplerate: int, size: int):
+        freqs = np.fft.rfftfreq(size, 1 / samplerate)
+        self.kick_bins = (freqs >= 40) & (freqs <= 120)
+        self.snare_bins = (freqs >= 1500) & (freqs <= 5000)
+        self.tone_bins = (freqs >= 80) & (freqs <= 2000)
+        self.pitch = (np.round(12 * np.log2(freqs[self.tone_bins] / 440)) % 12).astype(int)  # 0 = A
+        self.kick = deque(maxlen=4)   # last few hops, beat lands somewhere in there
+        self.snare = deque(maxlen=4)
+        self.kick_avg = self.snare_avg = 1e-9
+        self.chroma = np.zeros(12)    # notes summed since the last beat
+        self.chords: list[np.ndarray] = []
+        self.drums = np.zeros(4)      # kick - snare, per position in the bar
+        self.changes = np.zeros(4)    # chord change, per position in the bar
+        self.downbeat = 0             # which beat index % 4 is beat 1
+
+    def add(self, spectrum: np.ndarray) -> None:
+        self.kick.append(spectrum[self.kick_bins].sum())
+        self.snare.append(spectrum[self.snare_bins].sum())
+        self.chroma += np.bincount(self.pitch, weights=spectrum[self.tone_bins] ** 2, minlength=12)
+
+    def beat(self, index: int) -> None:
+        kick, snare = max(self.kick), max(self.snare)
+        self.kick_avg = 0.9 * self.kick_avg + 0.1 * kick if self.kick_avg > 1e-9 else kick
+        self.snare_avg = 0.9 * self.snare_avg + 0.1 * snare if self.snare_avg > 1e-9 else snare
+        self.drums *= BAR_MEMORY
+        self.changes *= BAR_MEMORY
+        self.drums[index % 4] += kick / self.kick_avg - snare / self.snare_avg
+
+        # chord of the beat that just ended vs the one before -> change at the start of the one that ended
+        self.chords = (self.chords + [self.chroma / (np.linalg.norm(self.chroma) + 1e-9)])[-2:]
+        self.chroma = np.zeros(12)
+        if len(self.chords) == 2:
+            self.changes[(index - 1) % 4] += 1 - float(self.chords[0] @ self.chords[1])
+
+        scores = [self.score(p) for p in range(4)]
+        best = int(np.argmax(scores))
+        if scores[best] > scores[self.downbeat] + BAR_SWITCH:
+            self.downbeat = best
+
+    def score(self, p: int) -> float:
+        d, c = self.drums, self.changes
+        drums = (d[p] + d[(p + 2) % 4] - d[(p + 1) % 4] - d[(p + 3) % 4]) / (np.abs(d).sum() + 1e-9)
+        return drums + c[p] / (c.sum() + 1e-9)
+
+
 # listens to pc audio
-# beats: aubio finds the bpm and locks to the beat grid -> evenly spaced
+# beats: BeatTracker finds the bpm and locks to the beat grid -> evenly spaced
+# accents: sharp attacks in the vocal range (300-3400 Hz) -> syllables, snares, stabs
 # lumi_hits: lumisync loudness jumps, no tempo, just reacts
 class AudioAnalyser(threading.Thread):
 
@@ -142,6 +279,12 @@ class AudioAnalyser(threading.Thread):
         self.beats = 0
         self.bpm = 0.0
         self.last_beat = 0.0
+        self.bar = 0            # position in the bar of the last beat, 0 = beat 1
+        self.grid = 0           # beat number on the grid, missed beats still count
+        self.grid_time = None   # audio time (s) of the last beat on the grid
+        self.accents = 0
+        self.last_accent = 0.0
+        self.accent_period = DEFAULT_PERIOD
         self.recent = np.zeros(LUMI_WINDOW)
         self.lumi_hits = 0
         self.lumi_level = 0.0
@@ -171,8 +314,11 @@ class AudioAnalyser(threading.Thread):
         self.device = loopback.name
         next_check = time.monotonic() + DEVICE_CHECK
 
-        tracker = aubio.tempo("default", 2 * self.hop, self.hop, self.samplerate)
-        lowpass = bass_filter(self.samplerate)
+        tracker = BeatTracker(self.samplerate, self.hop, self.size)
+        onsets = aubio.onset("specflux", 2 * self.hop, self.hop, self.samplerate)
+        onsets.set_minioi_s(ACCENT_GAP)
+        vocal = (biquad(self.samplerate, 300, "high"), biquad(self.samplerate, 3400, "low"))
+        bar = DownbeatFinder(self.samplerate, self.size)
         freqs = np.fft.rfftfreq(self.size, 1 / self.samplerate)
         bass_bins = (freqs >= 20) & (freqs <= 150)
         window = np.hanning(self.size)
@@ -180,6 +326,7 @@ class AudioAnalyser(threading.Thread):
         peak = 1.0
         lumi_gain = lumi.AutoGain(self.samplerate // self.hop)
 
+        read = 0  # samples so far -> audio clock, steadier than time.monotonic()
         with loopback.recorder(samplerate=self.samplerate, channels=2, blocksize=self.hop) as rec:
             while True:
                 if time.monotonic() >= next_check:
@@ -188,22 +335,58 @@ class AudioAnalyser(threading.Thread):
                     next_check = time.monotonic() + DEVICE_CHECK
 
                 new = rec.record(numframes=self.hop).mean(axis=1)
+                read += len(new)
                 buffer = np.concatenate((buffer[len(new):], new))
                 self.recent = buffer[-LUMI_WINDOW:].copy()
                 self.lumi_hit(lumi_gain)
 
-                bass = np.abs(np.fft.rfft(buffer * window))[bass_bins].sum()
+                spectrum = np.abs(np.fft.rfft(buffer * window))
+                bar.add(spectrum)
+                bass = spectrum[bass_bins].sum()
                 peak = max(bass, peak * 0.995, 0.5)  # slowly forget loud moments
                 self.level = min(bass / peak, 1.0)
 
-                tracker.set_threshold(0.6 - 0.5 * self.settings.sensitivity)
-                # bass only so it locks to the kick, not the hi-hats
-                if tracker(lowpass(new.astype(np.float32)))[0]:
-                    self.bpm = tracker.get_bpm()
+                threshold = 0.6 - 0.5 * self.settings.sensitivity
+                samples = new.astype(np.float32)
+                if tracker.process(spectrum):
+                    self.bpm = tracker.bpm
                     self.last_beat = time.monotonic()
                     self.beats += 1
+                    if self.on_grid(read / self.samplerate):
+                        bar.beat(self.grid)
+                        self.bar = (self.grid - bar.downbeat) % 4
                     if self.settings.detector == "aubio":
                         self.on_beat()
+
+                onsets.set_threshold(threshold - 0.1)  # vocals are softer than drums, 50 here = 70 for beats
+                if onsets(vocal[1](vocal[0](samples)))[0]:
+                    now = time.monotonic()
+                    self.accent_period = smooth_gap(self.accent_period, now - self.last_accent)
+                    self.last_accent = now
+                    self.accents += 1
+                    if self.settings.detector == "accents":
+                        self.on_beat()
+
+    # numbers beats by time not by count, so a missed beat is +2 and a doubled one is dropped
+    # -> one glitch from the tracker doesn't shift every bar position after it
+    def on_grid(self, t: float) -> bool:
+        if self.grid_time is not None:
+            steps = round((t - self.grid_time) * self.bpm / 60)
+            if steps == 0:
+                return False
+            self.grid += steps
+        self.grid_time = t
+        return True
+
+    # position in the bar (0 = beat 1) of a beat at time t, counted on from the last beat
+    def bar_at(self, t: float) -> int:
+        return (self.bar + round((t - self.last_beat) * self.bpm / 60)) % 4
+
+    # count and seconds between hits for the detectors that just react
+    def hits(self) -> tuple[int, float]:
+        if self.settings.detector == "accents":
+            return self.accents, self.accent_period
+        return self.lumi_hits, self.hit_period
 
     # same level/transient maths as their MusicPatternRenderer.render
     def lumi_hit(self, gain: lumi.AutoGain) -> None:
@@ -214,9 +397,7 @@ class AudioAnalyser(threading.Thread):
         threshold = LUMI_HIT + 0.3 * (0.5 - self.settings.sensitivity)  # sensitivity 50 -> their 0.55
         now = time.monotonic()
         if transient > threshold and now - self.last_hit > LUMI_HIT_GAP:
-            gap = now - self.last_hit
-            if gap < 2.0:
-                self.hit_period = 0.8 * self.hit_period + 0.2 * gap
+            self.hit_period = smooth_gap(self.hit_period, now - self.last_hit)
             self.last_hit = now
             self.lumi_hits += 1
             if self.settings.detector == "lumisync":
@@ -224,6 +405,10 @@ class AudioAnalyser(threading.Thread):
 
 
 # predicts beats from the tempo so they can go out early
+def smooth_gap(period: float, gap: float) -> float:
+    return 0.8 * period + 0.2 * gap if gap < 2.0 else period  # long gap = music stopped, not tempo
+
+
 class BeatClock:
     def __init__(self):
         self.count = 0
@@ -246,6 +431,10 @@ class BeatClock:
         self.count += 1
         self.last_target = target
         self.fired_at = now
+
+    # jump the count so count % 4 == position in the bar -> ¼ steps on beat 1, ½ on 1 and 3
+    def align(self, bar: int) -> None:
+        self.count += (bar - self.count) % 4
 
 
 # ---------- patterns ----------
@@ -475,7 +664,7 @@ async def run_lights(settings: Settings, analyser: AudioAnalyser, stop: threadin
         shown = [(-255, -255, -255)] * BULBS  # unknown -> every bulb gets sent first
         budget = PacketBudget()
         last_keep_alive = time.monotonic()
-        seen_hits = analyser.lumi_hits
+        seen_hits = analyser.hits()[0]
 
         while not stop.is_set():
             if not client.is_connected:
@@ -484,19 +673,21 @@ async def run_lights(settings: Settings, analyser: AudioAnalyser, stop: threadin
                 raise RuntimeError(f"Audio capture failed: {analyser.error}")
 
             now = time.monotonic()
-            if settings.detector == "lumisync":
-                # no tempo so nothing to predict, fire on each hit
-                on_beat = analyser.lumi_hits != seen_hits
-                seen_hits = analyser.lumi_hits
-                if on_beat:
-                    clock.fire(now, now)
-                beat_period = analyser.hit_period
-            else:
+            if settings.detector == "aubio":
                 target = clock.next_target(analyser, now, settings.delay)
                 on_beat = target is not None and now >= target - settings.delay
                 if on_beat:
                     clock.fire(target, now)
+                    if settings.auto_bar:
+                        clock.align(analyser.bar_at(target))
                 beat_period = 60 / analyser.bpm if analyser.bpm > 0 else DEFAULT_PERIOD
+            else:
+                # no tempo so nothing to predict, fire on each hit
+                hits, beat_period = analyser.hits()
+                on_beat = hits != seen_hits
+                seen_hits = hits
+                if on_beat:
+                    clock.fire(now, now)
             choose_pattern(settings, now, on_beat)
 
             smooth = max(analyser.level, smooth * 0.85)  # fast rise, slow fall
@@ -524,7 +715,7 @@ async def run_lights(settings: Settings, analyser: AudioAnalyser, stop: threadin
 
             # wait 1/FPS, until the next predicted beat, or wake on a detected beat
             wait = 1 / FPS
-            target = None if settings.detector == "lumisync" else clock.next_target(analyser, time.monotonic(), settings.delay)
+            target = clock.next_target(analyser, time.monotonic(), settings.delay) if settings.detector == "aubio" else None
             if target is not None:
                 wait = max(0.0, min(wait, target - settings.delay - time.monotonic()))
             try:
@@ -558,7 +749,7 @@ class App:
         detector.pack(pady=(5, 0))
         tk.Label(detector, text="Beat detection:").pack(side="left")
         self.detector = tk.StringVar(value=self.settings.detector)
-        for value, text in (("aubio", "Beat tracker (aubio)"), ("lumisync", "LumiSync hits")):
+        for value, text in (("aubio", "Beats"), ("accents", "Accents (vocals & hits)"), ("lumisync", "LumiSync")):
             tk.Radiobutton(detector, text=text, variable=self.detector, value=value,
                            command=lambda: setattr(self.settings, "detector", self.detector.get())).pack(side="left")
 
@@ -572,7 +763,8 @@ class App:
 
         step_options = tk.Frame(root)
         step_options.pack()
-        for attr, text in (("offbeat", "Offbeat (½, ¼)"), ("random_steps", "Randomise (1, ½, ¼)")):
+        for attr, text in (("auto_bar", "Auto beat 1"), ("offbeat", "Offbeat (½, ¼)"),
+                           ("random_steps", "Randomise (1, ½, ¼)")):
             self.checkbox(step_options, text, attr)
 
         boxes = tk.Frame(root)
@@ -722,7 +914,7 @@ class App:
     def now_playing(self) -> str:
         s = self.settings
         if s.current is None:
-            return "Tick at least one pattern"
+            return "Connecting..." if s.patterns else "Tick at least one pattern"
         text = f"Now: {PATTERNS[s.current][0]}"
         if switches(s):
             text += f"   ·   switch in {max(0, s.switch_at - time.monotonic()):.0f} s"
@@ -730,12 +922,15 @@ class App:
 
     def watch_beats(self) -> None:
         a = self.analyser
-        lumisync = self.settings.detector == "lumisync"
-        beats = a.lumi_hits if lumisync else a.beats
+        beat_grid = self.settings.detector == "aubio"
+        beats = a.beats if beat_grid else a.hits()[0]
         if beats != self.seen_beats:
             self.seen_beats = beats
             odd = beats % 2 == 1
-            tempo = f"~{60 / a.hit_period:.0f} hits/min" if lumisync else f"bpm: {a.bpm:.0f}"
+            if beat_grid:
+                tempo = f"bpm: {a.bpm:.0f}   bar: {'1234'[:a.bar + 1].ljust(4, '·')}"
+            else:
+                tempo = f"~{60 / a.hits()[1]:.0f} hits/min"
             self.beat_box.config(text=f"beats: {beats}   {tempo}", bg="white" if odd else "black",
                                  fg="black" if odd else "white")
         self.root.after(10, self.watch_beats)
