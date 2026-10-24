@@ -16,9 +16,16 @@ python govee.py off
 python music.py
 ```
 
+optional AI beat model (~800 MB)
+```
+pip install beat-this
+```
+on linux add `--extra-index-url https://download.pytorch.org/whl/cpu` or it pulls the huge gpu version
+
 Sources  
 https://github.com/aubio/aubio  
-https://github.com/Minlor/LumiSync
+https://github.com/Minlor/LumiSync  
+https://github.com/CPJKU/beat_this
 
 ONLY WORKS FOR THESE  
 https://www.amazon.com/dp/B0BR3RSN1J?_encoding=UTF8&psc=1

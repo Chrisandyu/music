@@ -2,6 +2,7 @@
 # python music.py
 
 import asyncio
+import importlib.util
 import colorsys
 import math
 import random
@@ -13,11 +14,12 @@ from collections import deque
 from dataclasses import dataclass
 from tkinter import colorchooser
 
-import aubio
 import numpy as np
 import soundcard as sc
 
-import lumisync_audio as lumi
+
+# optional model beat tracker: pip install beat-this (pulls in torch, loaded in its own thread so the window opens fast)
+MODEL_INSTALLED = importlib.util.find_spec("beat_this") is not None
 
 from govee import ADDRESS, BULBS, KEEP_ALIVE, color, connect, power, send
 
@@ -30,22 +32,28 @@ DEFAULT_PERIOD = 0.5    # until the tempo is known
 DEVICE_CHECK = 2.0      # how often to check if the default speaker changed
 BAR_MEMORY = 0.95       # per beat, how slowly the beat 1 guess forgets old bars
 BAR_SWITCH = 0.15       # new beat 1 guess has to win by this much, stops it flickering
-ACCENT_GAP = 0.15       # s between accents at least
+DYNAMIC_BIG = 1.3       # this much louder than the 8 bars before -> chorus / drop, double steps
+DYNAMIC_SMALL = 0.7     # this much quieter -> breakdown, half steps
+DYNAMIC_LEAVE = 0.8     # leave a section once it's this far from its own loudness
+DYNAMIC_FILL = 2.0      # beat with this many times the usual hits -> drum fill, 4x steps while it lasts
+DYNAMIC_RANDOM = 0.15   # chance of a small random twist at a phrase start
 TRACK_WINDOW = 8.0      # s of onsets the beat tracker looks back at
 TEMPO_PRIOR = 120       # bpm the tracker leans towards when unsure
 TEMPO_KEEP = 0.05       # octaves, how hard it holds its current tempo -> cross rhythms can't take over
+MODEL = "small0"        # beat this checkpoint, ~0.3 s per run on 2 cpu threads
+MODEL_WINDOW = 10.0     # s of audio it looks at
+MODEL_EVERY = 1.0       # s between runs
+MODEL_RATE = 22050      # sample rate it wants
+WARMUP = 3.0            # s of audio before the first beat guess
+PEAK_DELTA = 2.0        # mic: a hit has to beat the recent average by this many times the usual onset level
+PEAK_GAP = 0.08         # mic: s between hits at least
+PEAK_GATE = 2.0         # mic: louder than the room's background noise by this much (2 = 6 dB)
 TEMPO_ESCAPE = 4.0      # s a clearly better tempo has to keep winning to take over -> fixes a bad first guess
 STEP_CHOICES = ((0.25, "¼"), (0.5, "½"), (1, "1"), (2, "2"), (3, "3"), (4, "4"))
 RANDOM_STEPS = (1, 0.5, 0.25)
 PACKET_RATE = 25        # lights acked ~29/s when i measured, more just queues up as lag
 PACKET_BURST = 3
 COLOUR_STEP = 16        # round colours so close ones share a packet
-
-# lumisync defaults (lumisync/config/options.py)
-LUMI_WINDOW = int(0.023 * 48000)
-LUMI_GAIN = 1.7
-LUMI_HIT = 0.55                   # their auto director calls this a hit
-LUMI_HIT_GAP = 0.2
 
 PRESETS = (
     (255, 0, 0), (255, 96, 0), (255, 200, 0), (0, 255, 0), (0, 255, 160),
@@ -109,32 +117,22 @@ class Settings:
     def __init__(self):
         self.brightness = 0.8
         self.intensity = 0.7    # 0 = steady, 1 = follows the music fully
-        self.sensitivity = 0.5
-        self.detector = "aubio"  # or "accents" / "lumisync"
+        self.detector = "model" if MODEL_INSTALLED else "beats"
+        self.source = "desktop"  # or "mic": mic reacts to sound peaks in the room instead of beats
+        self.dynamic = True     # steps follow the music: bigger in choruses, fills, calmer in breakdowns
         self.delay = 0.05       # send beats early to cover bluetooth lag
         self.scheme = "Police"    # or "Custom"
         self.color1, self.color2 = SCHEMES[self.scheme]
         self.random_colours = False
         self.steps_per_beat = 1
-        self.offbeat = False      # ½ and ¼ step on the upbeat instead
+        self.land = 0             # which beat of the bar ½ and ¼ land on, 0 = beat 1
         self.auto_bar = True      # line ½ and ¼ up with beat 1 of the bar
         self.random_steps = False
         self.patterns = ["pulse"]
         self.switch_seconds = 20.0
         self.current: str | None = None  # set by the lights thread
+        self.dynamic_now = ""
         self.switch_at = 0.0
-
-
-# rbj cookbook biquad, kind = "low" or "high" pass
-def biquad(samplerate: int, cutoff: float, kind: str) -> aubio.digital_filter:
-    w0 = 2 * np.pi * cutoff / samplerate
-    alpha = np.sin(w0) / (2 * 0.707)
-    cos = np.cos(w0)
-    a0 = 1 + alpha
-    b0, b1 = ((1 - cos) / 2, 1 - cos) if kind == "low" else ((1 + cos) / 2, -(1 + cos))
-    f = aubio.digital_filter(3)
-    f.set_biquad(b0 / a0, b1 / a0, b0 / a0, -2 * cos / a0, (1 - alpha) / a0)
-    return f
 
 
 # live beat tracker with tempo memory (ellis 2007 / librosa style, made online)
@@ -162,7 +160,7 @@ class BeatTracker:
         self.onsets.append(0.0 if self.prev is None else float(np.dot(np.maximum(mag - self.prev, 0), self.weights)))
         self.prev = mag
         self.frame += 1
-        if self.frame % self.every == 0 and len(self.onsets) >= 4 * self.fps:
+        if self.frame % self.every == 0 and len(self.onsets) >= WARMUP * self.fps:
             self.update()
         if self.next_beat is not None and self.frame >= self.next_beat:
             self.next_beat += self.period
@@ -215,6 +213,108 @@ class BeatTracker:
             self.next_beat += 0.5 * ((target - self.next_beat + period / 2) % period - period / 2)
 
 
+# runs beat this (pretrained beat + downbeat model, cpjku) every second on the last 10 s
+# result: (s per beat, time.monotonic() of its last beat, bar position of that beat), None when no beat
+class BeatModel(threading.Thread):
+    def __init__(self, analyser: "AudioAnalyser"):
+        super().__init__(daemon=True)
+        self.analyser = analyser
+        self.result: tuple[float, float, int] | None = None
+        self.status = "model loading (first time downloads it)"
+
+    def run(self) -> None:
+        try:
+            import soxr
+            import torch
+            from beat_this.inference import Audio2Beats
+            torch.set_num_threads(2)  # leave cpu for the rest
+            model = Audio2Beats(MODEL, device="cpu")
+            self.resample = soxr.resample
+            self.status = "model running"
+            while True:
+                started = time.monotonic()
+                settings = self.analyser.settings
+                in_use = settings.detector == "model" and settings.source == "desktop"
+                self.result = self.predict(model) if in_use else None  # paused when not in use, saves cpu
+                time.sleep(max(0.0, MODEL_EVERY - (time.monotonic() - started)))
+        except Exception as exc:
+            self.status = f"model failed: {exc}"
+            self.result = None
+
+    def predict(self, model) -> tuple[float, float, int] | None:
+        a = self.analyser
+        chunks, end = list(a.history), a.history_end
+        if len(chunks) * a.hop < WARMUP * a.samplerate:
+            return None
+        audio = np.concatenate(chunks).astype(np.float32)
+        beats, downbeats = model(self.resample(audio, a.samplerate, MODEL_RATE), MODEL_RATE)
+        if len(beats) < 4:
+            return None
+        recent = beats[-12:]
+        rough = float(np.median(np.diff(recent)))
+        k = np.round((recent - recent[-1]) / rough)  # beat numbers, so a skipped beat doesn't bend the fit
+        period, last = np.polyfit(k, recent, 1)       # straight line through its beats -> exact tempo + phase
+        downbeats = downbeats[downbeats <= last + period / 2]
+        bar = round((last - downbeats[-1]) / period) % 4 if len(downbeats) else 0
+        return float(period), end - (len(audio) / a.samplerate - last), int(bar)
+
+
+# smart hit detection for the mic: superflux (bock & widmer 2013) + online peak picking like madmom.
+# 24 bands per octave, each band compared to the max of its neighbours 2 frames back
+# -> wobbly sounds (singing vibrato, fan hum) don't count, real hits (claps, drums, knocks) do.
+# hit = highest of the last 30 ms, well above the recent average, not too soon after the last one,
+# louder than a moment ago, and louder than the room's background noise (learnt as it goes)
+class PeakDetector:
+    def __init__(self, samplerate: int, hop: int, size: int = 2048):
+        self.size = size
+        self.window = np.hanning(size)
+        fps = samplerate / hop
+        freqs = np.fft.rfftfreq(size, 1 / samplerate)
+        keep = (freqs >= 30) & (freqs <= 16000)
+        band = np.round(24 * np.log2(freqs[keep] / 30)).astype(int)
+        _, self.band = np.unique(band, return_inverse=True)  # close bins share a band, no empty bands
+        self.keep, self.bands = keep, self.band.max() + 1
+        self.frames = deque(maxlen=3)
+        self.recent = deque(maxlen=int(0.1 * fps))  # 100 ms for the local average
+        self.last3 = deque(maxlen=3)                # 30 ms for "highest so far"
+        self.usual = 1e-9                           # slow average onset level -> threshold scales itself
+        self.loudest = 1e-9                         # for hit strength
+        self.noise = None                           # room background, slowly allowed to rise
+        self.rms = deque([0.0, 0.0], maxlen=2)      # loudness 2 frames back -> a hit has to get louder
+        self.since = 10 ** 9
+        self.gap = PEAK_GAP * fps
+
+    # returns how hard the hit was (0 to 1) when this frame is a hit, else None
+    def process(self, samples: np.ndarray) -> float | None:
+        mag = np.abs(np.fft.rfft(samples * self.window))[self.keep]
+        x = np.log10(1 + np.bincount(self.band, weights=mag, minlength=self.bands))
+        flux = 0.0
+        if len(self.frames) == 3:
+            ref = self.frames[0]
+            ref = np.maximum(ref, np.maximum(np.roll(ref, 1), np.roll(ref, -1)))  # max filter over 3 bands
+            flux = float(np.maximum(x - ref, 0).sum())
+        self.frames.append(x)
+
+        rms = float(np.sqrt(np.mean(samples[-len(samples) // 4:] ** 2))) + 1e-12
+        self.noise = rms if self.noise is None else min(rms, self.noise * 1.0005)
+        louder = rms > 1.1 * self.rms[0]  # a sound stopping sprays a click too, but it isn't a hit
+        self.rms.append(rms)
+
+        average = np.mean(self.recent) if self.recent else 0.0
+        highest = flux >= max(self.last3, default=0.0)
+        self.recent.append(flux)
+        self.last3.append(flux)
+        self.usual += 0.005 * (flux - self.usual)
+        self.loudest = max(flux, self.loudest * 0.9995)
+        self.since += 1
+
+        if (highest and louder and flux > average + PEAK_DELTA * self.usual and self.since >= self.gap
+                and rms > PEAK_GATE * self.noise):
+            self.since = 0
+            return min(1.0, flux / self.loudest)
+        return None
+
+
 # finds beat 1 of the bar without looking the song up (goto & muraoka style):
 # kick on 1 and 3, snare on 2 and 4, chords change on 1
 class DownbeatFinder:
@@ -263,10 +363,9 @@ class DownbeatFinder:
         return drums + c[p] / (c.sum() + 1e-9)
 
 
-# listens to pc audio
+# listens to the pc audio and / or the mic
 # beats: BeatTracker finds the bpm and locks to the beat grid -> evenly spaced
-# accents: sharp attacks in the vocal range (300-3400 Hz) -> syllables, snares, stabs
-# lumi_hits: lumisync loudness jumps, no tempo, just reacts
+# model: beat this does it instead (BeatModel), the beats get played like a metronome
 class AudioAnalyser(threading.Thread):
 
     def __init__(self, settings: Settings, samplerate: int = 48000, size: int = 4096, hop: int = 512):
@@ -282,14 +381,20 @@ class AudioAnalyser(threading.Thread):
         self.bar = 0            # position in the bar of the last beat, 0 = beat 1
         self.grid = 0           # beat number on the grid, missed beats still count
         self.grid_time = None   # audio time (s) of the last beat on the grid
-        self.accents = 0
-        self.last_accent = 0.0
-        self.accent_period = DEFAULT_PERIOD
-        self.recent = np.zeros(LUMI_WINDOW)
-        self.lumi_hits = 0
-        self.lumi_level = 0.0
-        self.last_hit = 0.0
-        self.hit_period = DEFAULT_PERIOD  # smoothed gap between hits
+        self.beat_stats = deque(maxlen=64)  # (loudness, hits) per beat, for dynamic
+        self.loud_sum = 0.0
+        self.hops = 0
+        self.beat_hits = 0           # hits so far in this beat, a fill has lots
+        self.flux = deque([0.0, 0.0], maxlen=2)
+        self.flux_mean, self.flux_var = 0.0, 1.0
+        self.flux_peak = 1e-9        # loudest recent onset, slowly forgotten
+        self.history = deque(maxlen=int(MODEL_WINDOW * samplerate / hop))  # for the model
+        self.history_end = 0.0
+        self.model: BeatModel | None = None
+        self.synced = None
+        self.next_tick, self.next_bar = 0.0, 0
+        self.strength = 1.0          # mic: how hard the last hit was, 0 to 1
+        self.hit_gap = DEFAULT_PERIOD  # mic: smoothed time between hits
         self.on_beat = lambda: None  # lights loop sets this to wake instantly
         self.device = "starting"
         self.error: Exception | None = None
@@ -307,38 +412,41 @@ class AudioAnalyser(threading.Thread):
         except Exception as exc:
             self.error = exc
 
-    # records the default speaker until it changes (e.g. bluetooth speaker connects) then returns
+    # records until the default device or the desktop / mic choice changes, then returns
     def listen(self) -> None:
-        speaker = sc.default_speaker()
-        loopback = sc.get_microphone(id=str(speaker.name), include_loopback=True)
-        self.device = loopback.name
+        source = self.settings.source
+        defaults = self.defaults()
+        if source == "desktop":
+            device, channels = sc.get_microphone(id=str(sc.default_speaker().name), include_loopback=True), 2
+        else:
+            device, channels = sc.default_microphone(), 1
+        self.device = device.name
         next_check = time.monotonic() + DEVICE_CHECK
 
         tracker = BeatTracker(self.samplerate, self.hop, self.size)
-        onsets = aubio.onset("specflux", 2 * self.hop, self.hop, self.samplerate)
-        onsets.set_minioi_s(ACCENT_GAP)
-        vocal = (biquad(self.samplerate, 300, "high"), biquad(self.samplerate, 3400, "low"))
         bar = DownbeatFinder(self.samplerate, self.size)
+        peaks = PeakDetector(self.samplerate, self.hop)
         freqs = np.fft.rfftfreq(self.size, 1 / self.samplerate)
         bass_bins = (freqs >= 20) & (freqs <= 150)
         window = np.hanning(self.size)
         buffer = np.zeros(self.size)
         peak = 1.0
-        lumi_gain = lumi.AutoGain(self.samplerate // self.hop)
 
         read = 0  # samples so far -> audio clock, steadier than time.monotonic()
-        with loopback.recorder(samplerate=self.samplerate, channels=2, blocksize=self.hop) as rec:
+        with device.recorder(samplerate=self.samplerate, channels=channels, blocksize=self.hop) as rec:
             while True:
+                if source != self.settings.source:
+                    return
                 if time.monotonic() >= next_check:
-                    if sc.default_speaker().name != speaker.name:
+                    if self.defaults() != defaults:
                         return
                     next_check = time.monotonic() + DEVICE_CHECK
 
                 new = rec.record(numframes=self.hop).mean(axis=1)
                 read += len(new)
                 buffer = np.concatenate((buffer[len(new):], new))
-                self.recent = buffer[-LUMI_WINDOW:].copy()
-                self.lumi_hit(lumi_gain)
+                self.history.append(new)
+                self.history_end = time.monotonic()
 
                 spectrum = np.abs(np.fft.rfft(buffer * window))
                 bar.add(spectrum)
@@ -346,26 +454,72 @@ class AudioAnalyser(threading.Thread):
                 peak = max(bass, peak * 0.995, 0.5)  # slowly forget loud moments
                 self.level = min(bass / peak, 1.0)
 
-                threshold = 0.6 - 0.5 * self.settings.sensitivity
-                samples = new.astype(np.float32)
-                if tracker.process(spectrum):
+                beat = tracker.process(spectrum)
+                self.loud_sum += float(np.sqrt(np.mean(new ** 2)))
+                self.count_hit(tracker.onsets[-1])
+                self.hops += 1
+                if source == "mic":
+                    hit = peaks.process(buffer[-peaks.size:])
+                    if hit is not None:
+                        now = time.monotonic()
+                        gap = now - self.last_beat
+                        self.hit_gap = 0.8 * self.hit_gap + 0.2 * gap if gap < 2.0 else self.hit_gap
+                        self.strength, self.last_beat = hit, now
+                        self.beat_done()
+                elif self.settings.detector == "model":
+                    self.model_tick()
+                elif beat:
                     self.bpm = tracker.bpm
                     self.last_beat = time.monotonic()
-                    self.beats += 1
                     if self.on_grid(read / self.samplerate):
                         bar.beat(self.grid)
                         self.bar = (self.grid - bar.downbeat) % 4
-                    if self.settings.detector == "aubio":
-                        self.on_beat()
+                    self.beat_done()
 
-                onsets.set_threshold(threshold - 0.1)  # vocals are softer than drums, 50 here = 70 for beats
-                if onsets(vocal[1](vocal[0](samples)))[0]:
-                    now = time.monotonic()
-                    self.accent_period = smooth_gap(self.accent_period, now - self.last_accent)
-                    self.last_accent = now
-                    self.accents += 1
-                    if self.settings.detector == "accents":
-                        self.on_beat()
+    # name of the default device we should be listening to
+    def defaults(self) -> str:
+        return str(sc.default_speaker().name if self.settings.source == "desktop" else sc.default_microphone().name)
+
+    # a hit = onset peak clearly above the usual level (mean + 1.5 sd) and at least a quarter of the
+    # loudest recent ones, so quiet parts don't turn noise into hits
+    def count_hit(self, flux: float) -> None:
+        before, mid = self.flux
+        self.flux_peak = max(flux, self.flux_peak * 0.9997)  # ~30 s memory
+        strong = mid > self.flux_mean + 1.5 * np.sqrt(self.flux_var) and mid > 0.25 * self.flux_peak
+        if mid > before and mid >= flux and strong:
+            self.beat_hits += 1
+        self.flux_mean += 0.02 * (flux - self.flux_mean)
+        self.flux_var += 0.02 * ((flux - self.flux_mean) ** 2 - self.flux_var)
+        self.flux.append(flux)
+
+    # counts the beat, keeps how loud and busy it was, wakes the lights
+    def beat_done(self) -> None:
+        if self.hops:
+            self.beat_stats.append((self.loud_sum / self.hops, self.beat_hits))
+        self.loud_sum = 0.0
+        self.hops = self.beat_hits = 0
+        self.beats += 1
+        self.on_beat()
+
+    # model mode: plays the model's beats like a metronome, re-synced every time it runs
+    def model_tick(self) -> None:
+        if self.model is None:
+            self.model = BeatModel(self)
+            self.model.start()
+        result = self.model.result
+        if result is None:
+            return
+        period, last, bar = result
+        now = time.monotonic()
+        if result is not self.synced:  # next beat on its grid that isn't played yet and isn't in the past
+            self.synced = result
+            n = max(1, math.floor((self.last_beat + period / 2 - last) / period) + 1, math.ceil((now - last) / period))
+            self.next_tick, self.next_bar = last + n * period, (bar + n) % 4
+        if now >= self.next_tick:
+            self.bpm, self.last_beat, self.bar = 60 / period, self.next_tick, self.next_bar
+            self.next_tick += period
+            self.next_bar = (self.next_bar + 1) % 4
+            self.beat_done()
 
     # numbers beats by time not by count, so a missed beat is +2 and a doubled one is dropped
     # -> one glitch from the tracker doesn't shift every bar position after it
@@ -382,33 +536,8 @@ class AudioAnalyser(threading.Thread):
     def bar_at(self, t: float) -> int:
         return (self.bar + round((t - self.last_beat) * self.bpm / 60)) % 4
 
-    # count and seconds between hits for the detectors that just react
-    def hits(self) -> tuple[int, float]:
-        if self.settings.detector == "accents":
-            return self.accents, self.accent_period
-        return self.lumi_hits, self.hit_period
-
-    # same level/transient maths as their MusicPatternRenderer.render
-    def lumi_hit(self, gain: lumi.AutoGain) -> None:
-        bands = gain.process(lumi.spectral_bands(self.recent, self.samplerate))
-        level = lumi.MusicPatternRenderer._level(sum(bands), LUMI_GAIN)
-        transient = min(1.0, max(0.0, level - self.lumi_level) * 4.0)
-        self.lumi_level = level
-        threshold = LUMI_HIT + 0.3 * (0.5 - self.settings.sensitivity)  # sensitivity 50 -> their 0.55
-        now = time.monotonic()
-        if transient > threshold and now - self.last_hit > LUMI_HIT_GAP:
-            self.hit_period = smooth_gap(self.hit_period, now - self.last_hit)
-            self.last_hit = now
-            self.lumi_hits += 1
-            if self.settings.detector == "lumisync":
-                self.on_beat()
-
 
 # predicts beats from the tempo so they can go out early
-def smooth_gap(period: float, gap: float) -> float:
-    return 0.8 * period + 0.2 * gap if gap < 2.0 else period  # long gap = music stopped, not tempo
-
-
 class BeatClock:
     def __init__(self):
         self.count = 0
@@ -478,15 +607,84 @@ def hue(h: float) -> tuple:
 
 
 # beats -> pattern steps. 2 splits every beat in half, ½ steps every 2nd beat
-def to_steps(count: int, since: float, period: float, per_beat: float, offbeat: bool) -> tuple[int, float, float]:
+def to_steps(count: int, since: float, period: float, per_beat: float, land: int) -> tuple[int, float, float]:
     if per_beat >= 1:
         n = int(per_beat)
         length = period / n
         sub = min(n - 1, int(since / length))
         return count * n + sub, since - sub * length, length
     n = round(1 / per_beat)
-    count += n // 2 if offbeat else 0  # halfway through the group
+    count -= land  # land = 1 -> ½ steps on beats 2 and 4, ¼ on beat 2
     return count // n, since + (count % n) * period, period * n
+
+
+# keeps the pattern position going on smoothly when steps per beat changes (randomise, dynamic)
+class StepCounter:
+    def __init__(self):
+        self.per_beat: tuple[float, int] | None = None
+        self.offset = 0
+
+    def __call__(self, count: int, since: float, period: float, per_beat: float, land: int) -> tuple[int, float, float]:
+        if (per_beat, land) != self.per_beat:
+            if self.per_beat is not None:
+                old = to_steps(count, 0, period, *self.per_beat)[0]
+                self.offset += old - to_steps(count, 0, period, per_beat, land)[0]
+            self.per_beat = (per_beat, land)
+        step, since, period = to_steps(count, since, period, per_beat, land)
+        return step + self.offset, since, period
+
+
+# steps follow the song instead of just the bpm (novelty style, like muller's novelty curves):
+# much louder than the 8 bars before -> chorus / drop -> double, much quieter -> breakdown -> half,
+# a section lasts until it moves away from its own loudness. lots of hits in one beat -> drum fill -> 4x.
+# plus a small random twist at phrase starts
+class Dynamic:
+    def __init__(self):
+        self.level = 1.0    # 2 big, 0.5 calm
+        self.section = 0.0  # loudness of the current big / calm section
+        self.fill = False   # 4x for the rest of this beat
+        self.twist = 1.0    # random one bar twist
+        self.until = -1
+        self.name = "normal"
+
+    def on_beat(self, count: int, stats: deque) -> None:
+        self.fill = False
+        if count >= self.until:
+            self.twist = 1.0
+        if len(stats) >= 16:
+            loud = np.array(stats)[:, 0]
+            self.update_level(loud[-2:].mean(), np.median(loud[-34:-2]))
+        if count % 16 == 0 and self.twist == 1.0 and random.random() < DYNAMIC_RANDOM:
+            self.twist, self.until = random.choice((2.0, 0.5)), count + 4
+        self.name = {2.0: "big", 0.5: "calm"}.get(self.level, "normal")
+
+    def update_level(self, now: float, before: float) -> None:
+        if self.level == 1.0:
+            if now > DYNAMIC_BIG * before:
+                self.level, self.section = 2.0, now
+            elif now < DYNAMIC_SMALL * before:
+                self.level, self.section = 0.5, now
+            return
+        ratio = now / self.section
+        if self.level == 2.0 and ratio < DYNAMIC_SMALL:  # chorus straight into a breakdown
+            self.level, self.section = 0.5, now
+        elif self.level == 0.5 and ratio > 1 / DYNAMIC_SMALL:  # breakdown straight into a drop
+            self.level, self.section = 2.0, now
+        elif (self.level == 2.0 and ratio < DYNAMIC_LEAVE) or (self.level == 0.5 and ratio > 1 / DYNAMIC_LEAVE):
+            self.level = 1.0
+        else:  # follow slow drift inside the section, a loud fill shouldn't drag it up
+            self.section += 0.1 * (min(max(now, self.section / 1.2), self.section * 1.2) - self.section)
+
+    # every frame: hits so far in this beat vs the usual -> fill right away, not a beat late
+    def live(self, hits: int, stats: deque) -> None:
+        if not self.fill and len(stats) >= 16:
+            usual = np.median(np.array(stats)[-32:, 1])
+            if hits >= max(3, DYNAMIC_FILL * usual):
+                self.fill, self.name = True, "fill"
+
+    @property
+    def mult(self) -> float:
+        return 4.0 if self.fill else self.level * self.twist
 
 
 # --- any tempo ---
@@ -549,6 +747,15 @@ def sections(n: int):
     return pattern
 
 
+def p_zip(c: Ctx) -> list:
+    # beats 1-2 zip on from one end (head in colour 2), beats 3-4 zip off from the end that lit first
+    t = (c.beat % 2 + c.phase) / 2  # 0 -> 1 across two steps
+    edge = min(BULBS, int(t * (BULBS + 1)))
+    if c.beat % 4 < 2:
+        return [c.c2 if i == edge - 1 else c.c1 if i < edge else OFF for i in range(BULBS)]
+    return [c.c1 if i >= edge else OFF for i in range(BULBS)]
+
+
 def p_theater(c: Ctx) -> list:
     # every third bulb, moves one per step
     return [dim(c.c1, c.flash) if (i + c.beat) % 3 == 0 else dim(c.c2, 0.15) for i in range(BULBS)]
@@ -568,6 +775,7 @@ PATTERNS = {  # key: (label, function)
     "thirds": ("Thirds (swap on beat)", sections(3)),
     "quarters": ("Quarters (swap on beat)", sections(4)),
     "theater": ("Theater chase (fast)", p_theater),
+    "zip": ("Zip on / off (4 beats)", p_zip),
 }
 
 
@@ -661,10 +869,11 @@ async def run_lights(settings: Settings, analyser: AudioAnalyser, stop: threadin
 
         smooth = 0.0
         clock = BeatClock()
+        steps, dynamic = StepCounter(), Dynamic()
         shown = [(-255, -255, -255)] * BULBS  # unknown -> every bulb gets sent first
         budget = PacketBudget()
         last_keep_alive = time.monotonic()
-        seen_hits = analyser.hits()[0]
+        seen_hits = analyser.beats
 
         while not stop.is_set():
             if not client.is_connected:
@@ -673,26 +882,29 @@ async def run_lights(settings: Settings, analyser: AudioAnalyser, stop: threadin
                 raise RuntimeError(f"Audio capture failed: {analyser.error}")
 
             now = time.monotonic()
-            if settings.detector == "aubio":
+            mic = settings.source == "mic"
+            if mic:  # no tempo to predict, fire on each hit
+                on_beat = analyser.beats != seen_hits
+                seen_hits = analyser.beats
+                if on_beat:
+                    clock.fire(now, now)
+                beat_period = analyser.hit_gap
+            else:
                 target = clock.next_target(analyser, now, settings.delay)
                 on_beat = target is not None and now >= target - settings.delay
                 if on_beat:
                     clock.fire(target, now)
                     if settings.auto_bar:
                         clock.align(analyser.bar_at(target))
+                    dynamic.on_beat(clock.count, analyser.beat_stats)
                 beat_period = 60 / analyser.bpm if analyser.bpm > 0 else DEFAULT_PERIOD
-            else:
-                # no tempo so nothing to predict, fire on each hit
-                hits, beat_period = analyser.hits()
-                on_beat = hits != seen_hits
-                seen_hits = hits
-                if on_beat:
-                    clock.fire(now, now)
+            dynamic.live(analyser.beat_hits, analyser.beat_stats)
+            settings.dynamic_now = dynamic.name if settings.dynamic and not mic else ""
             choose_pattern(settings, now, on_beat)
 
             smooth = max(analyser.level, smooth * 0.85)  # fast rise, slow fall
-            step, since, period = to_steps(clock.count, now - clock.fired_at, beat_period,
-                                           settings.steps_per_beat, settings.offbeat)
+            per_beat = settings.steps_per_beat * (dynamic.mult if settings.dynamic and not mic else 1.0)
+            step, since, period = steps(clock.count, now - clock.fired_at, beat_period, per_beat, settings.land)
             ctx = Ctx(
                 beat=step,
                 since=since,
@@ -702,7 +914,7 @@ async def run_lights(settings: Settings, analyser: AudioAnalyser, stop: threadin
                 c1=settings.color1, c2=settings.color2,
                 rng=random.Random(step),
             )
-            ctx.flash = ctx.level(math.exp(-since / FLASH_DECAY))
+            ctx.flash = ctx.level(math.exp(-since / FLASH_DECAY) * (analyser.strength if mic else 1.0))
             ctx.loud = ctx.level(smooth)
 
             frame = PATTERNS[settings.current][1](ctx) if settings.current else [OFF] * BULBS
@@ -715,7 +927,7 @@ async def run_lights(settings: Settings, analyser: AudioAnalyser, stop: threadin
 
             # wait 1/FPS, until the next predicted beat, or wake on a detected beat
             wait = 1 / FPS
-            target = clock.next_target(analyser, time.monotonic(), settings.delay) if settings.detector == "aubio" else None
+            target = None if mic else clock.next_target(analyser, time.monotonic(), settings.delay)
             if target is not None:
                 wait = max(0.0, min(wait, target - settings.delay - time.monotonic()))
             try:
@@ -731,6 +943,9 @@ class App:
         self.settings = Settings()
         self.analyser = AudioAnalyser(self.settings)
         self.analyser.start()
+        if self.settings.detector == "model":  # load it now, not when the first audio comes in
+            self.analyser.model = BeatModel(self.analyser)
+            self.analyser.model.start()
         self.thread: threading.Thread | None = None
         self.stop = threading.Event()
         self.error: str | None = None
@@ -742,16 +957,27 @@ class App:
 
         self.slider("Brightness", "brightness")
         self.slider("Intensity", "intensity")
-        self.slider("Beat sensitivity", "sensitivity")
         self.slider("Delay compensation (ms)", "delay", to=400, scale=1000)
 
         detector = tk.Frame(root)
         detector.pack(pady=(5, 0))
         tk.Label(detector, text="Beat detection:").pack(side="left")
         self.detector = tk.StringVar(value=self.settings.detector)
-        for value, text in (("aubio", "Beats"), ("accents", "Accents (vocals & hits)"), ("lumisync", "LumiSync")):
-            tk.Radiobutton(detector, text=text, variable=self.detector, value=value,
-                           command=lambda: setattr(self.settings, "detector", self.detector.get())).pack(side="left")
+        model_text = "Model" if MODEL_INSTALLED else "Model (pip install beat-this)"
+        self.detector_buttons = []
+        for value, text in (("model", model_text), ("beats", "Beats")):
+            button = tk.Radiobutton(detector, text=text, variable=self.detector, value=value,
+                                    command=lambda: setattr(self.settings, "detector", self.detector.get()))
+            button.pack(side="left")
+            self.detector_buttons.append((value, button))
+
+        sources = tk.Frame(root)
+        sources.pack()
+        tk.Label(sources, text="Listen to:").pack(side="left")
+        self.source = tk.StringVar(value=self.settings.source)
+        for value, text in (("desktop", "Desktop audio"), ("mic", "Mic (reacts to sound peaks)")):
+            tk.Radiobutton(sources, text=text, variable=self.source, value=value,
+                           command=lambda: setattr(self.settings, "source", self.source.get())).pack(side="left")
 
         steps = tk.Frame(root)
         steps.pack(pady=(5, 0))
@@ -763,10 +989,18 @@ class App:
 
         step_options = tk.Frame(root)
         step_options.pack()
-        for attr, text in (("auto_bar", "Auto beat 1"), ("offbeat", "Offbeat (½, ¼)"),
-                           ("random_steps", "Randomise (1, ½, ¼)")):
+        for attr, text in (("auto_bar", "Auto beat 1"), ("dynamic", "Dynamic"), ("random_steps", "Randomise (1, ½, ¼)")):
             self.checkbox(step_options, text, attr)
 
+        land = tk.Frame(root)
+        land.pack()
+        tk.Label(land, text="½ and ¼ land on beat:").pack(side="left")
+        self.land = tk.IntVar(value=self.settings.land)
+        for n in range(4):
+            tk.Radiobutton(land, text=str(n + 1), variable=self.land, value=n,
+                           command=lambda: setattr(self.settings, "land", self.land.get())).pack(side="left")
+
+        tk.Button(root, text="Tick all patterns", command=self.tick_all).pack(pady=(5, 0))
         boxes = tk.Frame(root)
         boxes.pack(padx=10, pady=5)
         self.ticks = {}
@@ -824,7 +1058,7 @@ class App:
         # debug: flips black/white on every detected beat
         self.beat_box = tk.Label(root, text="beats: 0", height=4, bg="black", fg="white")
         self.beat_box.pack(fill="x", padx=10)
-        self.device_label = tk.Label(root, fg="grey40")
+        self.device_label = tk.Label(root, fg="grey40", wraplength=360)  # long device names wrap, window stays narrow
         self.device_label.pack()
 
         self.status = tk.Label(root, text="Stopped")
@@ -842,6 +1076,11 @@ class App:
         var = tk.BooleanVar(value=getattr(self.settings, attr))
         tk.Checkbutton(parent, text=text, variable=var,
                        command=lambda: setattr(self.settings, attr, var.get())).pack(side="left")
+
+    def tick_all(self) -> None:
+        for var in self.ticks.values():
+            var.set(True)
+        self.update_patterns()
 
     def update_patterns(self) -> None:
         self.settings.patterns = [key for key, var in self.ticks.items() if var.get()]
@@ -904,7 +1143,12 @@ class App:
         running = self.thread is not None and self.thread.is_alive()
         self.button.config(text="Stop" if running else "Start")
         self.status.config(text=self.error or (self.now_playing() if running else "Stopped"))
-        self.device_label.config(text=f"listening to: {self.analyser.device}")
+        model = self.analyser.model
+        extra = f"   ·   {model.status}" if model and self.settings.detector == "model" and self.settings.source == "desktop" else ""
+        self.device_label.config(text=f"listening to: {self.analyser.device}{extra}")
+        for value, button in self.detector_buttons:  # mic reacts to peaks, so beat detection doesn't apply
+            usable = self.settings.source == "desktop" and (value != "model" or MODEL_INSTALLED)
+            button.config(state="normal" if usable else "disabled")
         if self.steps.get() != self.settings.steps_per_beat:  # randomise changed it
             self.steps.set(self.settings.steps_per_beat)
         if self.swatches["color1"].cget("bg") != self.hex(self.settings.color1):  # randomise changed them
@@ -916,23 +1160,23 @@ class App:
         if s.current is None:
             return "Connecting..." if s.patterns else "Tick at least one pattern"
         text = f"Now: {PATTERNS[s.current][0]}"
+        if s.dynamic_now:
+            text += f"   ·   {s.dynamic_now}"
         if switches(s):
             text += f"   ·   switch in {max(0, s.switch_at - time.monotonic()):.0f} s"
         return text
 
     def watch_beats(self) -> None:
         a = self.analyser
-        beat_grid = self.settings.detector == "aubio"
-        beats = a.beats if beat_grid else a.hits()[0]
-        if beats != self.seen_beats:
-            self.seen_beats = beats
-            odd = beats % 2 == 1
-            if beat_grid:
-                tempo = f"bpm: {a.bpm:.0f}   bar: {'1234'[:a.bar + 1].ljust(4, '·')}"
+        if a.beats != self.seen_beats:
+            self.seen_beats = a.beats
+            odd = a.beats % 2 == 1
+            if self.settings.source == "mic":
+                info = f"hits: {a.beats}   ~{60 / a.hit_gap:.0f} hits/min   strength: {a.strength:.0%}"
             else:
-                tempo = f"~{60 / a.hits()[1]:.0f} hits/min"
-            self.beat_box.config(text=f"beats: {beats}   {tempo}", bg="white" if odd else "black",
-                                 fg="black" if odd else "white")
+                info = f"beats: {a.beats}   bpm: {a.bpm:.0f}   bar: {'1234'[:a.bar + 1].ljust(4, '·')}"
+            self.beat_box.config(text=info,
+                                 bg="white" if odd else "black", fg="black" if odd else "white")
         self.root.after(10, self.watch_beats)
 
 
